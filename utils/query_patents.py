@@ -13,7 +13,7 @@ def find_similar_patents_to(keyword):
     print(f"Searching BQ for top 25 patents related to {keyword}...")
 
     query = r"""
-    SELECT publication_number, abstract, url
+    SELECT publication_number, title, abstract, url
     FROM `patents-public-data.google_patents_research.publications` 
     WHERE abstract LIKE '%{}%'
     LIMIT 25
