@@ -125,9 +125,12 @@ if __name__ == '__main__':
         # Use ProcessPoolExecutor to parallelize the pipeline calls
         print("Fetching batch of synonyms...")
         with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
-            # create lambda functions to pass fixed keyword argument (for 25 patent batch)
-            fetch_batch_synonyms = lambda input_abstract: fetch_synonyms(input_abstract, keyword)
-            batch_compare_synonyms = lambda compare_synonyms: compare_patents.get_similarity_score(original_synonyms, compare_synonyms)
+            # create functions to pass fixed keyword argument (for 25 patent batch)
+            def fetch_batch_synonyms(input_abstract):
+                return fetch_synonyms(input_abstract, keyword)
+            def batch_compare_synonyms(compare_synonyms):
+                return compare_patents.get_similarity_score(original_synonyms, compare_synonyms)
+            
 
             # Run the fetch_batch_synonyms function on each input text in parallel
             synonym_results = list(executor.map(fetch_batch_synonyms, abstracts_batch))
