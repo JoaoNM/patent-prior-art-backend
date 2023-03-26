@@ -2,3 +2,4 @@ auth.py
 /bert-for-patents
 google_credentials.json
 OPENAI_KEY.py
+/keyword_inference/testenv
