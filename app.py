@@ -2,7 +2,8 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-import time
+import concurrent.futures
+import multiprocessing as mp
 
 # Set up imports from other directories
 parent_dir = os.path.dirname(os.path.abspath(__file__))
@@ -11,10 +12,22 @@ utils_path = os.path.join(parent_dir, "utils")
 sys.path.append(keyword_inf_path)
 sys.path.append(utils_path)
 
-# Only using HF API for now. It's faster– this is just for demo purposes. 
-from keyword_inference import hf_inferrer
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Using local model version for keyword inference. HF API maxes out request limits. 
 from keyword_inference import local_fill_mask
 from utils import query_patents, detect_abstract_keywords, compare_patents
+
+# --------------------------------------------------------------------------------
+# HIGH LEVEL OVERVIEW: 
+
+# STEP 1: Paste your patent abstract here. 
+# STEP 2: Detect keywords in the abstract [DONE]
+# (GHOST STEP: Run inference query on the keywords, to find more related keywords (divergence))
+# STEP 4: Query BQ to find patents with the detected keywords [DONE]
+# STEP 5: Run inference query on patents found compared with the original patent. MASK word should be the same in both cases. (run for every keyword) [HALF-DONE]
+# STEP 6: Get comparison score, and return top 10 patents with the highest score.
+# --------------------------------------------------------------------------------
 
 def extract_synonym_data(synonym_request_response):
     extracted_synonyms = set()
@@ -34,107 +47,142 @@ def extract_synonym_data(synonym_request_response):
         print("Error extracting synonyms from response. Check the response format.")
         print(synonym_request_response)
 
-        if (type(synonym_request_response) == dict):
-            if (synonym_request_response["error"] == 'Model anferico/bert-for-patents is currently loading'):
-                print("Model is loading. Waiting 30s to request again...")
-                time.sleep(30)
-
         return []
     
     return list(extracted_synonyms)
 
-# STEP 1: Paste your patent abstract here. 
-# STEP 2: Detect keywords in the abstract [DONE]
+def fetch_synonyms(patent_abstract, keyword):
+    return local_fill_mask.find_related_keywords(patent_abstract, keyword)
 
-# (GHOST STEP: Run inference query on the keywords, to find more related keywords (divergence))
+if __name__ == '__main__':
 
-# STEP 4: Query BQ to find patents with the detected keywords [DONE]
-# STEP 5: Run inference query on patents found compared with the original patent. MASK word should be the same in both cases. (run for every keyword) [HALF-DONE]
-# STEP 6: Get comparison score, and return top 10 patents with the highest score.
+    mp.set_start_method('spawn')
 
-patent_abstract = input("Paste your base patent abstract here: ")
-# remove in production: 
-patent_abstract = "The present invention relates to an ovarian-derived hydrogel material, which can be useful for three-dimensional in vitro culturing of cells, cell therapy, fertility preservation, drug delivery, site-specific remodeling and repair of damaged tissue, and/or diagnostic kits."
+    patent_abstract = input("Paste your base patent abstract here: ")
+    # remove in production: 
+    patent_abstract = "The present invention relates to an ovarian-derived hydrogel material, which can be useful for three-dimensional in vitro culturing of cells, cell therapy, fertility preservation, drug delivery, site-specific remodeling and repair of damaged tissue, and/or diagnostic kits."
 
-# Detect keywords in abstract! 
+    # Detect keywords in abstract! 
 
-keywords = detect_abstract_keywords.get_keywords_from_gpt(patent_abstract)
+    keywords = detect_abstract_keywords.get_keywords_from_gpt(patent_abstract)
 
-# Query BQ to find patents with the detected keywords. Break the query response into a list of abstracts
-patents_df = pd.DataFrame()
+    # Query BQ to find patents with the detected keywords. Break the query response into a list of abstracts
+    patents_df = pd.DataFrame()
 
-patents_df['publication_number'] = []
-patents_df['title'] = []
-patents_df['abstract'] = []
-patents_df['url'] = []
-patents_df['keyword'] = []
-patents_df['similarity_score'] = []
+    patents_df['publication_number'] = []
+    patents_df['title'] = []
+    patents_df['abstract'] = []
+    patents_df['url'] = []
+    patents_df['keyword'] = []
+    patents_df['similarity_score'] = []
 
-print("Finding similar patents for each keyword...")
+    print("Finding similar patents for each keyword...")
 
-# Set true / false to use the HF API or the local model
-use_hf_api = False
-if (use_hf_api):
-    def fetch_synonyms(patent_abstract, keyword):
-        return hf_inferrer.find_keyword_synonyms(patent_abstract, keyword)
-else:
-    def fetch_synonyms(patent_abstract, keyword):
-        return local_fill_mask.find_related_keywords(patent_abstract, keyword)
+    # TODO: Parallelize this. Make it more efficient 
+    # with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        # synonym_results = list(executor.map(fetch_batch_synonyms, abstracts_batch))
 
-for i in range(len(keywords)):
-    print(f"KEYWORD [{i + 1}/{len(keywords)}]: {keywords[i]}")
-    df = query_patents.find_similar_patents_to(keywords[i])
-    df['keyword'] = keywords[i]
-    patents_df = pd.concat([patents_df, df], ignore_index=True)
+    for i in range(len(keywords)):
+        print(f"KEYWORD [{i + 1}/{len(keywords)}]: {keywords[i]}")
+        df = query_patents.find_similar_patents_to(keywords[i])
+        df['keyword'] = keywords[i]
+        patents_df = pd.concat([patents_df, df], ignore_index=True)
 
-print("SAMPLE RANDOM 30 ROWS:")
-print(patents_df.sample(30))
+    print("SAMPLE RANDOM 30 ROWS:")
+    print(patents_df.sample(30))
 
-# Run inference query on both patents. Extract list of keyword synonyms. Then, compare similarity scores.
-keyword_index = 0
-keyword = keywords[keyword_index]
-print("STARTING INFERENCE QUERIES...")
-print(f"KEYWORD 1: {keyword}")
-original_synonyms = []
-while (len(original_synonyms) == 0):
-    synonyms_response = fetch_synonyms(patent_abstract, keyword)
-    original_synonyms = extract_synonym_data(synonyms_response)
+    # Run inference query on both patents. Extract list of keyword synonyms. Then, compare similarity scores.
+    # keyword_index = 0
+    # keyword = keywords[keyword_index]
+    print("STARTING INFERENCE QUERIES...")
+    # print(f"KEYWORD 1: {keyword}")
+    # original_synonyms = []
+    # while (len(original_synonyms) == 0):
+    #     synonyms_response = fetch_synonyms(patent_abstract, keyword)
+    #     original_synonyms = extract_synonym_data(synonyms_response)
 
-for index, row in patents_df.iterrows():
-    synonyms_response = []
 
-    if (keyword_index != np.floor(index / 25)):
-        keyword_index += 1
-        keyword = keywords[keyword_index]
-        # we need to refresh the synonyms list
+    # NEW CODE: 
+    # (requesting inferences for all patents at once, via parrelelization)
+    last_row = patents_df.shape[0]
+    for i in range(len(keywords)):
+        # For each keyword, grab the original keywords 
+        keyword = keywords[i]
         original_synonyms = []
-        while (len(original_synonyms) == 0):
-            synonyms_response = fetch_synonyms(patent_abstract, keyword)
-            original_synonyms = extract_synonym_data(synonyms_response)
-        
+        synonyms_response = fetch_synonyms(patent_abstract, keyword)
+        original_synonyms = extract_synonym_data(synonyms_response)
+
         print("\n\n------------------------------------------------")
-        print(f"KEYWORD {keyword_index + 1}: {keyword}")
-        print("\n.------------------------------------------------")
-        print(original_synonyms)
-    
-    compare_synonyms = []
-    while (len(compare_synonyms) == 0):
-        synonyms_response = fetch_synonyms(row['abstract'], keyword)
-        compare_synonyms = extract_synonym_data(synonyms_response)
+        print(f"KEYWORD {i + 1}: {keyword}")
+        print("OG SYNONYMS: ", original_synonyms)
+        print("\n------------------------------------------------")
 
-    print(f"Comparing patent {index + 1}/{len(patents_df)}, KEYWORD: {keyword}...")
-    print(compare_synonyms)
-    similarity_score = compare_patents.get_similarity_score(original_synonyms, compare_synonyms)
-    patents_df.at[index, 'similarity_score'] = similarity_score
-    print(similarity_score)
-    
-    # get 
+        # batching abstracts 25 at a time
+        start_index = i * 25
+        end_index = start_index + 25
+        abstracts_batch = patents_df.loc[start_index:end_index, 'abstract'].tolist()
 
-# Ok, all the data is there! sort patents, and now we have the most similar! 
+        # Use ProcessPoolExecutor to parallelize the pipeline calls
+        print("Fetching batch of synonyms...")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
+            # create lambda functions to pass fixed keyword argument (for 25 patent batch)
+            fetch_batch_synonyms = lambda input_abstract: fetch_synonyms(input_abstract, keyword)
+            batch_compare_synonyms = lambda compare_synonyms: compare_patents.get_similarity_score(original_synonyms, compare_synonyms)
 
-patents_df = patents_df.sort_values(by=['similarity_score'], ascending=False)
+            # Run the fetch_batch_synonyms function on each input text in parallel
+            synonym_results = list(executor.map(fetch_batch_synonyms, abstracts_batch))
+            extracted_synonym_lists = [extract_synonym_data(synonym_result) for synonym_result in synonym_results]
 
-print("TOP 100 PATENTS:")
-print(patents_df.head(100))
+            print("Comparing patent keywords...")
+            # Run the batch_compare_synonyms function on each input text in parallel
+            similarity_results = list(executor.map(batch_compare_synonyms, extracted_synonym_lists))
+
+        # Add similarity score to dataframe 
+        patents_df.loc[start_index:end_index, 'similarity_score'] = similarity_results
+        # print dataframe preview from start_index to end_index
+        print(patents_df.loc[start_index:end_index, ['publication_number', 'title', 'abstract', 'url', 'keyword', 'similarity_score']])
+
+
+
+
+
+    # OLD CODE:
+    # (individually requesting inferences for each patent)
+    # for index, row in patents_df.iterrows():
+    #     synonyms_response = []
+
+    #     if (keyword_index != np.floor(index / 25)):
+    #         keyword_index += 1
+    #         keyword = keywords[keyword_index]
+    #         # we need to refresh the synonyms list
+    #         original_synonyms = []
+    #         while (len(original_synonyms) == 0):
+    #             synonyms_response = fetch_synonyms(patent_abstract, keyword)
+    #             original_synonyms = extract_synonym_data(synonyms_response)
+            
+    #         print("\n\n------------------------------------------------")
+    #         print(f"KEYWORD {keyword_index + 1}: {keyword}")
+    #         print("\n.------------------------------------------------")
+    #         print(original_synonyms)
+        
+    #     compare_synonyms = []
+    #     while (len(compare_synonyms) == 0):
+    #         synonyms_response = fetch_synonyms(row['abstract'], keyword)
+    #         compare_synonyms = extract_synonym_data(synonyms_response)
+
+    #     print(f"Comparing patent {index + 1}/{len(patents_df)}, KEYWORD: {keyword}...")
+    #     print(compare_synonyms)
+    #     similarity_score = compare_patents.get_similarity_score(original_synonyms, compare_synonyms)
+    #     patents_df.at[index, 'similarity_score'] = similarity_score
+    #     print(similarity_score)
+        
+        # get 
+
+    # Ok, all the data is there! sort patents, and now we have the most similar! 
+
+    patents_df = patents_df.sort_values(by=['similarity_score'], ascending=False)
+
+    print("TOP 100 PATENTS:")
+    print(patents_df.head(100))
 
 
